@@ -28,9 +28,9 @@ type CaptureFn =
     Box<dyn FnMut(bool, &mut Vec<u8>, Option<&DirtyTiles>) -> Result<bool> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
-fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
+fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let (card, outputs) = capture::open_card_path(path)?;
-    let output = &outputs[0];
+    let output = select_output(&outputs, output_name)?;
     let width = output.width;
     let height = output.height;
     tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
@@ -41,6 +41,26 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let capture_fn: CaptureFn =
         Box::new(move |force, dst, dt| capturer.capture_into(dst, force, dt));
     Ok((width, height, initial_data, capture_fn))
+}
+
+fn select_output<'a>(
+    outputs: &'a [capture::ActiveOutput],
+    output_name: Option<&str>,
+) -> Result<&'a capture::ActiveOutput> {
+    if let Some(name) = output_name {
+        return outputs
+            .iter()
+            .find(|o| o.connector_name == name)
+            .with_context(|| {
+                let available = outputs
+                    .iter()
+                    .map(|o| o.connector_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Output {name} not found. Available outputs: {available}")
+            });
+    }
+    outputs.first().context("No active outputs found")
 }
 
 /// Try to set up fbdev capture for a specific device path.
@@ -60,7 +80,7 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
 fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     if let Some(ref path) = config.device {
         // User specified a device — try as DRM first, then as fbdev
-        match try_drm_capture(path) {
+        match try_drm_capture(path, config.output.as_deref()) {
             Ok(result) => return Ok(result),
             Err(drm_err) => {
                 tracing::debug!("DRM capture failed for {path}: {drm_err}");
@@ -77,7 +97,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     // Auto-detect: try all DRM cards first
     match capture::open_card() {
         Ok((card, outputs)) => {
-            let output = &outputs[0];
+            let output = select_output(&outputs, config.output.as_deref())?;
             let width = output.width;
             let height = output.height;
             tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
@@ -127,7 +147,12 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let config = Config::parse();
 
@@ -385,11 +410,11 @@ fn do_capture(
 }
 
 async fn input_loop(input_rx: &mut mpsc::Receiver<InputEvent>, width: u32, height: u32) {
-    let mut touch = match input::touch::VirtualTouchscreen::new(width, height) {
-        Ok(t) => Some(t),
+    let mut mouse = match input::mouse::VirtualMouse::new(width, height) {
+        Ok(m) => Some(m),
         Err(e) => {
-            tracing::warn!("Failed to create virtual touchscreen: {e}");
-            tracing::warn!("Touch input will be disabled");
+            tracing::warn!("Failed to create virtual mouse: {e}");
+            tracing::warn!("Pointer input will be disabled");
             None
         }
     };
@@ -406,9 +431,9 @@ async fn input_loop(input_rx: &mut mpsc::Receiver<InputEvent>, width: u32, heigh
     while let Some(event) = input_rx.recv().await {
         match event {
             InputEvent::Pointer { button_mask, x, y } => {
-                if let Some(ref mut t) = touch {
-                    if let Err(e) = t.handle_pointer(button_mask, x, y) {
-                        tracing::warn!("Touch event error: {e}");
+                if let Some(ref mut m) = mouse {
+                    if let Err(e) = m.handle_pointer(button_mask, x, y) {
+                        tracing::warn!("Pointer event error: {e}");
                     }
                 }
             }

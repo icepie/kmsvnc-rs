@@ -10,6 +10,10 @@ pub struct Config {
     #[arg(short, long)]
     pub device: Option<String>,
 
+    /// DRM connector/output name to capture (e.g. DP-1, HDMI-A-1).
+    #[arg(long)]
+    pub output: Option<String>,
+
     /// VNC listen port
     #[arg(short, long, default_value_t = 5900)]
     pub port: u16,

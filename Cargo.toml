@@ -15,8 +15,11 @@ input-linux = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 des = "0.8"
 cipher = "0.4"
 rand = "0.9"
+
+[build-dependencies]
+cc = "1.2.55"

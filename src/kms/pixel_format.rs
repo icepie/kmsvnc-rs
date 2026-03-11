@@ -48,6 +48,37 @@ pub fn copy_rows_incremental(
     any_dirty
 }
 
+/// Incremental copy when `src` is already in BGRA/BGRX-compatible byte order.
+pub fn copy_bgra_rows_incremental(
+    dst: &mut [u8],
+    src: &[u8],
+    width: u32,
+    height: u32,
+    dirty_tiles: &DirtyTiles,
+) -> bool {
+    let row_bytes = (width * 4) as usize;
+    let tiles_x = width.div_ceil(TILE_SIZE) as usize;
+    let mut any_dirty = false;
+
+    for y in 0..height {
+        let row = y as usize * row_bytes;
+        let ty = (y / TILE_SIZE) as usize;
+
+        for tx in 0..tiles_x {
+            let x0 = tx * TILE_SIZE as usize * 4;
+            let tw = (TILE_SIZE.min(width - tx as u32 * TILE_SIZE) * 4) as usize;
+
+            if dst[row + x0..row + x0 + tw] != src[row + x0..row + x0 + tw] {
+                dst[row + x0..row + x0 + tw].copy_from_slice(&src[row + x0..row + x0 + tw]);
+                dirty_tiles.set(ty * tiles_x + tx);
+                any_dirty = true;
+            }
+        }
+    }
+
+    any_dirty
+}
+
 /// Convert raw framebuffer pixels to BGRA8888 format into a caller-provided buffer.
 /// The buffer is cleared and resized as needed.
 pub fn convert_to_bgra_into(

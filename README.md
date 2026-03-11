@@ -41,6 +41,7 @@ Then connect any VNC client to `localhost:5900`.
 
 ```
 --device <path>      Capture device path: /dev/dri/card*, /dev/fb* (default: auto-detect)
+--output <name>      DRM connector/output name to capture, e.g. DP-1
 --port <port>        VNC listen port (default: 5900)
 --fps <fps>          Capture frame rate (default: 30)
 --listen <addr>      Listen address (default: 0.0.0.0)
@@ -60,7 +61,7 @@ RUST_LOG=debug sudo $(which kmsvnc)   # detailed diagnostics
 
 - Raw encoding only (no compression — best used on LAN)
 - No encryption (VNC authentication uses DES challenge-response but traffic is unencrypted — use SSH tunneling for security)
-- Uses the first connected display output
+- Defaults to the first connected display output unless `--output` is set
 - Clipboard forwarding not implemented
 
 ## Troubleshooting

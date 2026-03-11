@@ -14,9 +14,8 @@ pub struct DirtyRect {
 ///
 /// The capture thread sets bits for tiles that changed.
 /// The VNC server drains (reads + clears) accumulated bits to get dirty rects.
-/// Supports up to 512 tiles (e.g., 22×22 tiles for 1408×1408 at 64px tiles).
 pub struct DirtyTiles {
-    bits: [AtomicU64; 8],
+    bits: Vec<AtomicU64>,
     tiles_x: u32,
     tiles_y: u32,
     width: u32,
@@ -27,12 +26,12 @@ impl DirtyTiles {
     pub fn new(width: u32, height: u32) -> Self {
         let tiles_x = width.div_ceil(TILE_SIZE);
         let tiles_y = height.div_ceil(TILE_SIZE);
-        assert!(
-            (tiles_x * tiles_y) as usize <= 512,
-            "Too many tiles ({tiles_x}x{tiles_y}), max 512"
-        );
+        let total_tiles = (tiles_x * tiles_y) as usize;
+        let word_count = total_tiles.div_ceil(64);
         Self {
-            bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            bits: std::iter::repeat_with(|| AtomicU64::new(0))
+                .take(word_count)
+                .collect(),
             tiles_x,
             tiles_y,
             width,
@@ -64,9 +63,9 @@ impl DirtyTiles {
     /// Atomically drain all dirty bits and convert to DirtyRect list.
     pub fn drain_to_rects(&self) -> Vec<DirtyRect> {
         // Atomically swap all words to 0
-        let mut words = [0u64; 8];
-        for (i, w) in words.iter_mut().enumerate() {
-            *w = self.bits[i].swap(0, Ordering::Relaxed);
+        let mut words = Vec::with_capacity(self.bits.len());
+        for bits in &self.bits {
+            words.push(bits.swap(0, Ordering::Relaxed));
         }
 
         let mut rects = Vec::new();

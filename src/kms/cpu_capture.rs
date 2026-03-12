@@ -167,6 +167,26 @@ struct VaapiCapture {
     scratch: Vec<u8>,
 }
 
+pub struct ScaledVaapiCapturer {
+    card: Card,
+    crtc_handle: crtc::Handle,
+    default_fb: framebuffer::Handle,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+    out_width: u32,
+    out_height: u32,
+    state: Option<ScaledVaapiState>,
+    last_fb_key: Option<u32>,
+}
+
+struct ScaledVaapiState {
+    gem_handle: drm::buffer::Handle,
+    ctx: *mut VaapiContext,
+    scratch: Vec<u8>,
+}
+
 pub struct Capturer {
     card: Card,
     crtc_handle: crtc::Handle,
@@ -187,6 +207,8 @@ pub struct Capturer {
 // resources (prime fd or card fd) are kept alive by Capturer.
 unsafe impl Send for Capturer {}
 unsafe impl Send for VaapiCapture {}
+unsafe impl Send for ScaledVaapiCapturer {}
+unsafe impl Send for ScaledVaapiState {}
 
 impl Capturer {
     pub fn new(card: Card, output: &ActiveOutput) -> Self {
@@ -692,6 +714,8 @@ impl VaapiCapture {
                 pitches.as_ptr(),
                 offsets.as_ptr(),
                 num_planes,
+                0,
+                0,
             )
         };
         if ctx.is_null() {
@@ -702,6 +726,93 @@ impl VaapiCapture {
             ctx,
             scratch: Vec::new(),
         })
+    }
+}
+
+impl ScaledVaapiCapturer {
+    pub fn new(card: Card, output: &ActiveOutput, out_width: u32, out_height: u32) -> Self {
+        Self {
+            card,
+            crtc_handle: output.crtc_handle,
+            default_fb: output.fb_handle,
+            src_x: output.x,
+            src_y: output.y,
+            width: output.width,
+            height: output.height,
+            out_width,
+            out_height,
+            state: None,
+            last_fb_key: None,
+        }
+    }
+
+    pub fn capture(&mut self) -> Result<&[u8]> {
+        let crtc_info = self.card.get_crtc(self.crtc_handle).context("Failed to get CRTC")?;
+        let fb_handle = crtc_info.framebuffer().unwrap_or(self.default_fb);
+        let fb_key = u32::from(fb_handle);
+        let info = self
+            .card
+            .get_planar_framebuffer(fb_handle)
+            .context("GET_FB2 failed for scaled VAAPI capture")?;
+        let gem_handle = info.buffers()[0].context("No buffer handle in framebuffer")?;
+
+        let reuse = self
+            .state
+            .as_ref()
+            .is_some_and(|state| self.last_fb_key == Some(fb_key) && state.gem_handle == gem_handle);
+        if !reuse {
+            let prime_fd = self
+                .card
+                .buffer_to_prime_fd(gem_handle, drm::RDWR)
+                .context("PRIME export failed for scaled VAAPI capture")?;
+            let modifier = match info.modifier().unwrap_or(DrmModifier::Invalid) {
+                DrmModifier::Invalid => 0,
+                m => m.into(),
+            };
+            let ctx = unsafe {
+                kmsvnc_vaapi_open(
+                    self.card.as_fd().as_raw_fd(),
+                    prime_fd.as_raw_fd(),
+                    self.src_x,
+                    self.src_y,
+                    self.width,
+                    self.height,
+                    info.size().0,
+                    info.size().1,
+                    info.pixel_format() as u32,
+                    modifier,
+                    info.pitches().as_ptr(),
+                    info.offsets().as_ptr(),
+                    info.buffers().iter().take_while(|h| h.is_some()).count() as u32,
+                    self.out_width,
+                    self.out_height,
+                )
+            };
+            if ctx.is_null() {
+                bail!("Scaled VAAPI init failed: {}", vaapi_last_error());
+            }
+            self.state = Some(ScaledVaapiState {
+                gem_handle,
+                ctx,
+                scratch: vec![0; (self.out_width * self.out_height * 4) as usize],
+            });
+            self.last_fb_key = Some(fb_key);
+        }
+
+        let state = self.state.as_mut().context("Scaled VAAPI state missing")?;
+        let ok = unsafe { kmsvnc_vaapi_capture(state.ctx, state.scratch.as_mut_ptr(), state.scratch.len()) };
+        if ok == 0 {
+            bail!("Scaled VAAPI capture failed: {}", vaapi_last_error());
+        }
+        Ok(&state.scratch)
+    }
+}
+
+impl Drop for ScaledVaapiState {
+    fn drop(&mut self) {
+        unsafe {
+            kmsvnc_vaapi_close(self.ctx);
+        }
     }
 }
 
@@ -733,6 +844,8 @@ unsafe extern "C" {
         pitches: *const u32,
         offsets: *const u32,
         num_planes: u32,
+        out_width: u32,
+        out_height: u32,
     ) -> *mut VaapiContext;
     fn kmsvnc_vaapi_capture(ctx: *mut VaapiContext, dst: *mut u8, dst_len: usize) -> i32;
     fn kmsvnc_vaapi_close(ctx: *mut VaapiContext);

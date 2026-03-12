@@ -24,6 +24,7 @@ use frame_diff::DirtyTiles;
 use kms::capture;
 use kms::dmabuf::DmabufCapturer;
 use kms::fbdev::FbdevCapture;
+use kms::cpu_capture::ScaledVaapiCapturer;
 use transport::{null::NullSink, tcp::TcpAnnexBSink, PacketSink};
 use video::VideoFrame;
 use vnc::server::{self, EncodingPreference, InputEvent};
@@ -290,6 +291,38 @@ fn setup_pipeline_frame_source(
     config: &Config,
     backend: &CaptureBackend,
 ) -> Result<Option<VideoFrameSourceFn>> {
+    if matches!(config.video_encoder, VideoEncoderMode::Software)
+        && config.video_width.is_some()
+        && config.video_height.is_some()
+    {
+        let CaptureBackend::Drm {
+            device_path,
+            output_name,
+        } = backend
+        else {
+            tracing::warn!("Scaled software video pipeline requires a DRM capture backend");
+            return Ok(None);
+        };
+
+        let (card, outputs) = capture::open_card_path(device_path)?;
+        let output = outputs
+            .iter()
+            .find(|o| o.connector_name == *output_name)
+            .with_context(|| format!("Output {output_name} disappeared before scaled pipeline setup"))?;
+        let out_width = config.video_width.unwrap();
+        let out_height = config.video_height.unwrap();
+        let mut capturer = ScaledVaapiCapturer::new(card, output, out_width, out_height);
+        tracing::info!(
+            "Experimental scaled capture source active: {}x{} for software video pipeline",
+            out_width,
+            out_height
+        );
+        return Ok(Some(Box::new(move || {
+            let data = capturer.capture()?.to_vec();
+            Ok(VideoFrame::new_cpu_bgra(out_width, out_height, data))
+        })));
+    }
+
     if !matches!(config.video_encoder, VideoEncoderMode::Vaapi) {
         return Ok(None);
     }

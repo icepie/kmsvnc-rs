@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
 
+use crate::kms::dmabuf::DmabufFrame;
+
 #[derive(Debug)]
 pub enum VideoFrame {
     CpuBgra {
@@ -8,6 +10,7 @@ pub enum VideoFrame {
         stride: u32,
         data: Vec<u8>,
     },
+    Dmabuf(DmabufFrame),
 }
 
 impl VideoFrame {
@@ -33,6 +36,13 @@ impl VideoFrame {
                 *stride = width * 4;
                 data
             }
+            Self::Dmabuf(_) => {
+                *self = Self::new_cpu_bgra(width, height, Vec::new());
+                match self {
+                    Self::CpuBgra { data, .. } => data,
+                    Self::Dmabuf(_) => unreachable!(),
+                }
+            }
         }
     }
 
@@ -44,6 +54,14 @@ impl VideoFrame {
                 stride,
                 data,
             } => Ok((*width, *height, *stride, data.as_slice())),
+            Self::Dmabuf(_) => bail!("Frame is DMA-BUF-backed, not CPU BGRA"),
+        }
+    }
+
+    pub fn as_dmabuf(&self) -> Result<&DmabufFrame> {
+        match self {
+            Self::Dmabuf(frame) => Ok(frame),
+            Self::CpuBgra { .. } => bail!("Frame is CPU BGRA, not DMA-BUF-backed"),
         }
     }
 

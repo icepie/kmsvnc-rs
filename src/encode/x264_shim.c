@@ -42,7 +42,7 @@ struct kmsvnc_x264_encoder *kmsvnc_x264_open(uint32_t width, uint32_t height) {
     param.i_height = (int)height;
     param.i_fps_num = 30;
     param.i_fps_den = 1;
-    param.i_keyint_max = 60;
+    param.i_keyint_max = 30;
     param.b_repeat_headers = 1;
     param.b_vfr_input = 0;
     param.b_annexb = 1;

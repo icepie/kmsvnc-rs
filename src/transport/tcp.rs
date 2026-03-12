@@ -10,6 +10,7 @@ use crate::transport::PacketSink;
 pub struct TcpAnnexBSink {
     listener: TcpListener,
     client: Option<TcpStream>,
+    waiting_for_keyframe: bool,
     packets: u64,
     bytes: u64,
     started_at: Instant,
@@ -26,6 +27,7 @@ impl TcpAnnexBSink {
         Ok(Self {
             listener,
             client: None,
+            waiting_for_keyframe: false,
             packets: 0,
             bytes: 0,
             started_at: Instant::now(),
@@ -43,6 +45,7 @@ impl TcpAnnexBSink {
                 }
                 tracing::info!("Experimental Annex B client connected: {peer}");
                 self.client = Some(stream);
+                self.waiting_for_keyframe = true;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
@@ -60,9 +63,18 @@ impl PacketSink for TcpAnnexBSink {
         }
 
         if let Some(stream) = self.client.as_mut() {
+            if self.waiting_for_keyframe {
+                if !packet.keyframe {
+                    return Ok(());
+                }
+                tracing::info!("Experimental Annex B stream starting from keyframe pts={}", packet.pts);
+                self.waiting_for_keyframe = false;
+            }
+
             if let Err(e) = stream.write_all(&packet.data) {
                 tracing::warn!("Experimental Annex B client disconnected: {e}");
                 self.client = None;
+                self.waiting_for_keyframe = false;
                 return Ok(());
             }
 

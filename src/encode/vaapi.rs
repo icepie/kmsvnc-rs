@@ -108,8 +108,8 @@ impl VaapiProbe {
         let raw = unsafe {
             kmsvnc_vaapi_encoder_open(
                 frame.drm_device_fd.as_raw_fd(),
-                frame.width,
-                frame.height,
+                frame.fb_width,
+                frame.fb_height,
                 frame.drm_format,
                 modifier,
                 object_fds.as_ptr(),

@@ -472,7 +472,7 @@ fn capture_loop(
                             false,
                             &mut reuse_frame,
                             &dirty_tiles,
-                            pipeline.as_mut(),
+                            &mut pipeline,
                         );
                     }
                     CaptureMode::Polling { .. } => {
@@ -501,7 +501,7 @@ fn capture_loop(
                                     false,
                                     &mut reuse_frame,
                                     &dirty_tiles,
-                                    pipeline.as_mut(),
+                                    &mut pipeline,
                                 );
                                 if changed {
                                     idle_streak = 0;
@@ -536,15 +536,16 @@ fn do_capture(
     force: bool,
     reuse_frame: &mut Option<VideoFrame>,
     dirty_tiles: &DirtyTiles,
-    pipeline: Option<&mut ExperimentalPipeline>,
+    pipeline: &mut Option<ExperimentalPipeline>,
 ) -> bool {
     let mut frame = reuse_frame.take().unwrap_or_else(|| VideoFrame::new_cpu_bgra(0, 0, Vec::new()));
 
     match capture_fn(force, &mut frame, Some(dirty_tiles)) {
         Ok(true) => {
-            if let Some(p) = pipeline {
+            if let Some(p) = pipeline.as_mut() {
                 if let Err(e) = p.process(&frame, force) {
                     tracing::warn!("Experimental video pipeline failed: {e}");
+                    *pipeline = None;
                 }
             }
             let new_arc = Arc::new(frame);

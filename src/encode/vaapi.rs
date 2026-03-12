@@ -10,20 +10,37 @@ use crate::video::VideoFrame;
 pub struct VaapiEncoder {
     codec: VideoCodec,
     probe: Option<VaapiProbe>,
+    probe_error: Option<String>,
 }
 
 impl VaapiEncoder {
     pub fn new(codec: VideoCodec) -> Self {
-        Self { codec, probe: None }
+        Self {
+            codec,
+            probe: None,
+            probe_error: None,
+        }
     }
 
     fn ensure_probe(&mut self, frame: &DmabufFrame) -> Result<()> {
+        if let Some(err) = &self.probe_error {
+            bail!("{err}");
+        }
         if self.probe.is_some() {
             return Ok(());
         }
-        let probe = VaapiProbe::new(frame)?;
+        let probe = match VaapiProbe::new(frame) {
+            Ok(probe) => probe,
+            Err(e) => {
+                let msg = e.to_string();
+                self.probe_error = Some(msg.clone());
+                bail!("{msg}");
+            }
+        };
         if !probe.supports_h264() {
-            bail!("VAAPI imported the DMA-BUF surface, but this driver does not expose an H.264 encode entrypoint");
+            let msg = "VAAPI imported the DMA-BUF surface, but this driver does not expose an H.264 encode entrypoint".to_string();
+            self.probe_error = Some(msg.clone());
+            bail!("{msg}");
         }
         self.probe = Some(probe);
         Ok(())

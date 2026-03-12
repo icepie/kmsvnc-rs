@@ -117,6 +117,14 @@ impl DmabufCapturer {
             bail!("Framebuffer exported no DMA-BUF planes");
         }
 
+        for plane in &planes {
+            let plane_end = plane.offset as u64 + plane.pitch as u64 * info.size().1 as u64;
+            let object = objects
+                .get_mut(plane.object_index)
+                .context("Plane referenced an invalid DMA-BUF object")?;
+            object.size = Some(object.size.unwrap_or(0).max(plane_end));
+        }
+
         Ok(DmabufFrame {
             width: self.width,
             height: self.height,

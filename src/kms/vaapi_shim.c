@@ -281,16 +281,21 @@ struct kmsvnc_vaapi *kmsvnc_vaapi_open(
     ctx->output_is_bgra = ((uint32_t)ctx->image.format.fourcc == VA_FOURCC_BGRA);
     ctx->src_x = src_x;
     ctx->src_y = src_y;
+    ctx->width = width;
+    ctx->height = height;
     ctx->fb_width = fb_width;
     ctx->fb_height = fb_height;
 
-    fprintf(stderr, "kmsvnc vaapi image fourcc=%u pitch=%u bgra=%d\n",
+    fprintf(stderr, "kmsvnc vaapi init fourcc=%u pitch=%u bgra=%d src=(%u,%u) size=%ux%u fb=%ux%u\n",
         (uint32_t)ctx->image.format.fourcc,
         ctx->image.pitches[0],
-        ctx->output_is_bgra);
-
-    ctx->width = width;
-    ctx->height = height;
+        ctx->output_is_bgra,
+        ctx->src_x,
+        ctx->src_y,
+        ctx->width,
+        ctx->height,
+        ctx->fb_width,
+        ctx->fb_height);
     return ctx;
 }
 

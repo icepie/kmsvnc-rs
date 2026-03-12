@@ -3,18 +3,33 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use cipher::{BlockEncrypt, KeyInit};
 use des::Des;
+use flate2::{Compress, Compression, FlushCompress};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 use crate::frame_diff::{self, DirtyTiles};
+use crate::video::VideoFrame;
 
 /// Input event forwarded from VNC client to the input subsystem.
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     Pointer { button_mask: u8, x: u16, y: u16 },
     Key { down: bool, keysym: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EncodingPreference {
+    Auto,
+    Raw,
+    Zlib,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferredEncoding {
+    Raw,
+    Zlib,
 }
 
 /// Client-negotiated pixel format.
@@ -198,11 +213,12 @@ pub async fn handle_client(
     mut stream: TcpStream,
     width: u16,
     height: u16,
-    mut frame_rx: watch::Receiver<Arc<Vec<u8>>>,
+    mut frame_rx: watch::Receiver<Arc<VideoFrame>>,
     capture_req_tx: std::sync::mpsc::Sender<()>,
     input_tx: mpsc::Sender<InputEvent>,
     password: Option<&str>,
     dirty_tiles: Arc<DirtyTiles>,
+    encoding_pref: EncodingPreference,
 ) -> Result<()> {
     // === RFB Handshake ===
 
@@ -370,19 +386,25 @@ pub async fn handle_client(
     let mut writer = BufWriter::with_capacity(65536, writer);
     let (update_req_tx, mut update_req_rx) = mpsc::channel::<bool>(4);
     let (pf_tx, pf_rx) = watch::channel(ClientPixelFormat::server_default());
+    let initial_encoding = match encoding_pref {
+        EncodingPreference::Auto | EncodingPreference::Raw => PreferredEncoding::Raw,
+        EncodingPreference::Zlib => PreferredEncoding::Zlib,
+    };
+    let (enc_tx, enc_rx) = watch::channel(initial_encoding);
 
     let reader_handle = tokio::spawn(async move {
-        let r = read_client_messages(reader, update_req_tx, input_tx, pf_tx).await;
+        let r = read_client_messages(reader, update_req_tx, input_tx, pf_tx, enc_tx, encoding_pref).await;
         if let Err(e) = &r {
             tracing::debug!("Client reader ended: {e}");
         }
         r
     });
 
-    let stride = width as usize * 4;
-
     // Reusable buffer for pixel format conversion
     let mut convert_buf = Vec::new();
+    let mut rect_buf = Vec::new();
+    let mut z_stream = Compress::new(Compression::fast(), true);
+    let mut zbuf = Vec::new();
 
     let writer_loop = async {
         loop {
@@ -403,6 +425,11 @@ pub async fn handle_client(
             while update_req_rx.try_recv().is_ok() {}
 
             let frame = frame_rx.borrow_and_update().clone();
+            frame
+                .validate_cpu_bgra(width as u32, height as u32)
+                .context("validate video frame")?;
+            let (_, _, stride_u32, frame_data) = frame.as_bgra().context("get BGRA frame")?;
+            let stride = stride_u32 as usize;
 
             let rects = if incremental {
                 // Drain accumulated dirty tiles set by the capture thread
@@ -429,6 +456,7 @@ pub async fn handle_client(
             // Get current client pixel format
             let pf = pf_rx.borrow().clone();
             let need_convert = !pf.matches_server_default();
+            let encoding = *enc_rx.borrow();
 
             // Build FramebufferUpdate
             let num_rects = rects.len() as u16;
@@ -443,26 +471,42 @@ pub async fn handle_client(
                 rhdr[2..4].copy_from_slice(&rect.y.to_be_bytes());
                 rhdr[4..6].copy_from_slice(&rect.width.to_be_bytes());
                 rhdr[6..8].copy_from_slice(&rect.height.to_be_bytes());
-                rhdr[8..12].copy_from_slice(&0i32.to_be_bytes()); // Raw encoding
-                writer.write_all(&rhdr).await.context("write rect header")?;
-
-                // Write tile data directly from frame buffer, row by row
+                rect_buf.clear();
                 for row in rect.y..rect.y + rect.height {
                     let start = row as usize * stride + rect.x as usize * 4;
                     let end = start + rect.width as usize * 4;
-                    let bgra_row = &frame[start..end];
+                    let bgra_row = &frame_data[start..end];
 
                     if need_convert {
                         convert_row_into(bgra_row, &pf, &mut convert_buf);
-                        writer
-                            .write_all(&convert_buf)
-                            .await
-                            .context("write rect data")?;
+                        rect_buf.extend_from_slice(&convert_buf);
                     } else {
+                        rect_buf.extend_from_slice(bgra_row);
+                    }
+                }
+
+                match encoding {
+                    PreferredEncoding::Raw => {
+                        rhdr[8..12].copy_from_slice(&0i32.to_be_bytes());
+                        writer.write_all(&rhdr).await.context("write rect header")?;
+                        writer.write_all(&rect_buf).await.context("write rect data")?;
+                    }
+                    PreferredEncoding::Zlib => {
+                        zbuf.clear();
+                        z_stream
+                            .compress_vec(&rect_buf, &mut zbuf, FlushCompress::Sync)
+                            .context("compress rect with zlib")?;
+
+                        rhdr[8..12].copy_from_slice(&6i32.to_be_bytes());
+                        writer.write_all(&rhdr).await.context("write rect header")?;
                         writer
-                            .write_all(bgra_row)
+                            .write_all(&(zbuf.len() as u32).to_be_bytes())
                             .await
-                            .context("write rect data")?;
+                            .context("write zlib length")?;
+                        writer
+                            .write_all(&zbuf)
+                            .await
+                            .context("write zlib rect data")?;
                     }
                 }
             }
@@ -488,6 +532,8 @@ async fn read_client_messages(
     update_req_tx: mpsc::Sender<bool>,
     input_tx: mpsc::Sender<InputEvent>,
     pf_tx: watch::Sender<ClientPixelFormat>,
+    enc_tx: watch::Sender<PreferredEncoding>,
+    encoding_pref: EncodingPreference,
 ) -> Result<()> {
     loop {
         let mut msg_type = [0u8; 1];
@@ -532,6 +578,33 @@ async fn read_client_messages(
                     .read_exact(&mut enc_buf)
                     .await
                     .context("read SetEncodings body")?;
+                let mut advertised = Vec::with_capacity(num_enc);
+                let client_supports_zlib = enc_buf
+                    .chunks_exact(4)
+                    .any(|chunk| i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == 6);
+                for chunk in enc_buf.chunks_exact(4) {
+                    let enc = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    advertised.push(enc);
+                }
+                let preferred = match encoding_pref {
+                    EncodingPreference::Raw => PreferredEncoding::Raw,
+                    EncodingPreference::Zlib => {
+                        if client_supports_zlib {
+                            PreferredEncoding::Zlib
+                        } else {
+                            PreferredEncoding::Raw
+                        }
+                    }
+                    EncodingPreference::Auto => {
+                        if client_supports_zlib {
+                            PreferredEncoding::Zlib
+                        } else {
+                            PreferredEncoding::Raw
+                        }
+                    }
+                };
+                tracing::info!("Client encodings: {:?}; selected {:?}", advertised, preferred);
+                let _ = enc_tx.send(preferred);
             }
             // FramebufferUpdateRequest
             3 => {

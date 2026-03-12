@@ -20,6 +20,7 @@ anyhow = "1"
 des = "0.8"
 cipher = "0.4"
 rand = "0.9"
+flate2 = "1"
 
 [build-dependencies]
 cc = "1.2.55"

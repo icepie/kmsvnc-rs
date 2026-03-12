@@ -1,5 +1,26 @@
 use clap::Parser;
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum EncodingMode {
+    Auto,
+    Raw,
+    Zlib,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum VideoEncoderMode {
+    None,
+    Software,
+    Vaapi,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum VideoCodecMode {
+    H264,
+    Hevc,
+    Av1,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "kmsvnc",
@@ -29,4 +50,16 @@ pub struct Config {
     /// VNC password for authentication (Type 2). No auth if omitted.
     #[arg(long)]
     pub password: Option<String>,
+
+    /// Preferred VNC encoding: raw, zlib, or auto.
+    #[arg(long, value_enum, default_value = "raw")]
+    pub encoding: EncodingMode,
+
+    /// Experimental video encoder pipeline (not active yet).
+    #[arg(long, value_enum, default_value = "none")]
+    pub video_encoder: VideoEncoderMode,
+
+    /// Preferred codec for the experimental video pipeline.
+    #[arg(long, value_enum, default_value = "h264")]
+    pub video_codec: VideoCodecMode,
 }

@@ -42,6 +42,9 @@ Then connect any VNC client to `localhost:5900`.
 ```
 --device <path>      Capture device path: /dev/dri/card*, /dev/fb* (default: auto-detect)
 --output <name>      DRM connector/output name to capture, e.g. DP-1
+--encoding <mode>    VNC encoding: raw, zlib, or auto (default: raw)
+--video-encoder <e>  Experimental video pipeline: none, software, vaapi
+--video-codec <c>    Experimental codec preference: h264, hevc, av1
 --port <port>        VNC listen port (default: 5900)
 --fps <fps>          Capture frame rate (default: 30)
 --listen <addr>      Listen address (default: 0.0.0.0)

@@ -1,7 +1,10 @@
 mod config;
+mod encode;
 mod frame_diff;
 mod input;
 mod kms;
+mod transport;
+mod video;
 mod vnc;
 
 use std::fs;
@@ -15,20 +18,40 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
-use config::Config;
+use config::{Config, EncodingMode, VideoCodecMode, VideoEncoderMode};
+use encode::{software::SoftwareEncoder, vaapi::VaapiEncoder, VideoCodec, VideoEncoder};
 use frame_diff::DirtyTiles;
 use kms::capture;
 use kms::fbdev::FbdevCapture;
-use vnc::server::{self, InputEvent};
+use transport::{null::NullSink, PacketSink};
+use video::VideoFrame;
+use vnc::server::{self, EncodingPreference, InputEvent};
 
-/// A boxed capture function: writes one BGRA frame into the provided buffer.
+/// A boxed capture function: writes one frame into the provided frame object.
 /// Returns `true` if a new frame was captured, `false` if unchanged.
 /// `dirty_tiles` is provided for incremental tile-level capture.
 type CaptureFn =
-    Box<dyn FnMut(bool, &mut Vec<u8>, Option<&DirtyTiles>) -> Result<bool> + Send>;
+    Box<dyn FnMut(bool, &mut VideoFrame, Option<&DirtyTiles>) -> Result<bool> + Send>;
+
+type EncoderBox = Box<dyn VideoEncoder + Send>;
+type PacketSinkBox = Box<dyn PacketSink + Send>;
+
+struct ExperimentalPipeline {
+    encoder: EncoderBox,
+    sink: PacketSinkBox,
+    pts: u64,
+}
+
+impl ExperimentalPipeline {
+    fn process(&mut self, frame: &VideoFrame, force_keyframe: bool) -> Result<()> {
+        let packet = self.encoder.encode(frame, force_keyframe, self.pts)?;
+        self.pts = self.pts.wrapping_add(1);
+        self.sink.submit(packet)
+    }
+}
 
 /// Try to set up DRM capture for a specific card path.
-fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
+fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
     let (card, outputs) = capture::open_card_path(path)?;
     let output = select_output(&outputs, output_name)?;
     let width = output.width;
@@ -39,8 +62,11 @@ fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, V
         .capture(true)?
         .expect("first capture must produce a frame");
     let capture_fn: CaptureFn =
-        Box::new(move |force, dst, dt| capturer.capture_into(dst, force, dt));
-    Ok((width, height, initial_data, capture_fn))
+        Box::new(move |force, frame, dt| {
+            let dst = frame.cpu_bgra_mut(width, height);
+            capturer.capture_into(dst, force, dt)
+        });
+    Ok((width, height, VideoFrame::new_cpu_bgra(width, height, initial_data), capture_fn))
 }
 
 fn select_output<'a>(
@@ -64,20 +90,21 @@ fn select_output<'a>(
 }
 
 /// Try to set up fbdev capture for a specific device path.
-fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
+fn try_fbdev_capture(path: &str) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
     let fbdev = FbdevCapture::open(path)?;
     let width = fbdev.width();
     let height = fbdev.height();
     let initial_data = fbdev.capture_frame()?;
-    let capture_fn: CaptureFn = Box::new(move |_force, dst, _dt| {
+    let capture_fn: CaptureFn = Box::new(move |_force, frame, _dt| {
+        let dst = frame.cpu_bgra_mut(width, height);
         fbdev.capture_frame_into(dst)?;
         Ok(true)
     });
-    Ok((width, height, initial_data, capture_fn))
+    Ok((width, height, VideoFrame::new_cpu_bgra(width, height, initial_data), capture_fn))
 }
 
 /// Set up capture with fallback chain: DRM (PRIME/dumb) -> fbdev.
-fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
+fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
     if let Some(ref path) = config.device {
         // User specified a device — try as DRM first, then as fbdev
         match try_drm_capture(path, config.output.as_deref()) {
@@ -105,9 +132,16 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             let initial_data = capturer
                 .capture(true)?
                 .expect("first capture must produce a frame");
-            let capture_fn: CaptureFn =
-                Box::new(move |force, dst, dt| capturer.capture_into(dst, force, dt));
-            return Ok((width, height, initial_data, capture_fn));
+            let capture_fn: CaptureFn = Box::new(move |force, frame, dt| {
+                let dst = frame.cpu_bgra_mut(width, height);
+                capturer.capture_into(dst, force, dt)
+            });
+            return Ok((
+                width,
+                height,
+                VideoFrame::new_cpu_bgra(width, height, initial_data),
+                capture_fn,
+            ));
         }
         Err(drm_err) => {
             tracing::debug!("DRM auto-detect failed: {drm_err}");
@@ -145,6 +179,32 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     )
 }
 
+fn select_video_codec(mode: &VideoCodecMode) -> VideoCodec {
+    match mode {
+        VideoCodecMode::H264 => VideoCodec::H264,
+        VideoCodecMode::Hevc => VideoCodec::Hevc,
+        VideoCodecMode::Av1 => VideoCodec::Av1,
+    }
+}
+
+fn setup_encoder(config: &Config) -> Option<EncoderBox> {
+    let codec = select_video_codec(&config.video_codec);
+    match config.video_encoder {
+        VideoEncoderMode::None => None,
+        VideoEncoderMode::Software => Some(Box::new(SoftwareEncoder::new(codec))),
+        VideoEncoderMode::Vaapi => Some(Box::new(VaapiEncoder::new(codec))),
+    }
+}
+
+fn setup_pipeline(config: &Config) -> Option<ExperimentalPipeline> {
+    let encoder = setup_encoder(config)?;
+    Some(ExperimentalPipeline {
+        encoder,
+        sink: Box::new(NullSink::new()),
+        pts: 0,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -159,6 +219,7 @@ async fn main() -> Result<()> {
     check_permissions();
 
     let (width, height, initial_data, capture_fn) = setup_capture(&config)?;
+    let pipeline = setup_pipeline(&config);
 
     // Shared dirty tile accumulator between capture thread and VNC server
     let dirty_tiles = Arc::new(DirtyTiles::new(width, height));
@@ -188,6 +249,7 @@ async fn main() -> Result<()> {
             shutdown_capture,
             fps,
             dirty_tiles_capture,
+            pipeline,
         )
     });
 
@@ -196,6 +258,11 @@ async fn main() -> Result<()> {
 
     // Share password across client tasks
     let password = Arc::new(config.password);
+    let encoding_pref = match config.encoding {
+        EncodingMode::Auto => EncodingPreference::Auto,
+        EncodingMode::Raw => EncodingPreference::Raw,
+        EncodingMode::Zlib => EncodingPreference::Zlib,
+    };
 
     // VNC server listen loop
     let addr = format!("{}:{}", config.listen, config.port);
@@ -222,10 +289,11 @@ async fn main() -> Result<()> {
                 let input_tx = input_tx.clone();
                 let password = password.clone();
                 let dirty_tiles = dirty_tiles.clone();
+                let encoding_pref = encoding_pref;
                 let w = width as u16;
                 let h = height as u16;
                 tokio::spawn(async move {
-                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, capture_req_tx, input_tx, password.as_deref(), dirty_tiles).await {
+                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, capture_req_tx, input_tx, password.as_deref(), dirty_tiles, encoding_pref).await {
                         tracing::info!("Client {peer} disconnected: {e}");
                     }
                 });
@@ -255,11 +323,12 @@ enum CaptureMode {
 
 fn capture_loop(
     mut capture_fn: CaptureFn,
-    frame_tx: watch::Sender<Arc<Vec<u8>>>,
+    frame_tx: watch::Sender<Arc<VideoFrame>>,
     capture_req_rx: std_mpsc::Receiver<()>,
     shutdown: Arc<AtomicBool>,
     fps: u32,
     dirty_tiles: Arc<DirtyTiles>,
+    mut pipeline: Option<ExperimentalPipeline>,
 ) {
     let poll_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let mut mode = CaptureMode::OnDemand;
@@ -267,7 +336,7 @@ fn capture_loop(
     let mut fast_request_count = 0u32;
 
     // Buffer pool: try to reuse the Vec from the previous Arc
-    let mut reuse_buf: Option<Vec<u8>> = None;
+    let mut reuse_frame: Option<VideoFrame> = None;
 
     // Idle backoff: reduce capture rate when screen content is unchanged.
     // Consecutive unchanged captures increase idle_streak; any change resets it.
@@ -315,8 +384,9 @@ fn capture_loop(
                             &mut capture_fn,
                             &frame_tx,
                             false,
-                            &mut reuse_buf,
+                            &mut reuse_frame,
                             &dirty_tiles,
+                            pipeline.as_mut(),
                         );
                     }
                     CaptureMode::Polling { .. } => {
@@ -343,8 +413,9 @@ fn capture_loop(
                                     &mut capture_fn,
                                     &frame_tx,
                                     false,
-                                    &mut reuse_buf,
+                                    &mut reuse_frame,
                                     &dirty_tiles,
+                                    pipeline.as_mut(),
                                 );
                                 if changed {
                                     idle_streak = 0;
@@ -375,21 +446,25 @@ fn capture_loop(
 /// Returns `true` if the frame content actually changed.
 fn do_capture(
     capture_fn: &mut CaptureFn,
-    frame_tx: &watch::Sender<Arc<Vec<u8>>>,
+    frame_tx: &watch::Sender<Arc<VideoFrame>>,
     force: bool,
-    reuse_buf: &mut Option<Vec<u8>>,
+    reuse_frame: &mut Option<VideoFrame>,
     dirty_tiles: &DirtyTiles,
+    pipeline: Option<&mut ExperimentalPipeline>,
 ) -> bool {
-    // Try to reclaim the buffer from the previous Arc (if refcount == 1)
-    let mut buf = reuse_buf.take().unwrap_or_default();
+    let mut frame = reuse_frame.take().unwrap_or_else(|| VideoFrame::new_cpu_bgra(0, 0, Vec::new()));
 
-    match capture_fn(force, &mut buf, Some(dirty_tiles)) {
+    match capture_fn(force, &mut frame, Some(dirty_tiles)) {
         Ok(true) => {
-            let new_arc = Arc::new(buf);
+            if let Some(p) = pipeline {
+                if let Err(e) = p.process(&frame, force) {
+                    tracing::warn!("Experimental video pipeline failed: {e}");
+                }
+            }
+            let new_arc = Arc::new(frame);
             let old_arc = frame_tx.send_replace(new_arc);
-            // Try to reclaim the old buffer for next frame
-            if let Ok(old_vec) = Arc::try_unwrap(old_arc) {
-                *reuse_buf = Some(old_vec);
+            if let Ok(old_frame) = Arc::try_unwrap(old_arc) {
+                *reuse_frame = Some(old_frame);
             }
             true
         }
@@ -397,13 +472,12 @@ fn do_capture(
             // Frame unchanged — notify VNC server to unblock changed().await
             // (no dirty tiles set, so server sends empty FramebufferUpdate)
             frame_tx.send_modify(|_| {});
-            *reuse_buf = Some(buf);
+            *reuse_frame = Some(frame);
             false
         }
         Err(e) => {
             tracing::warn!("Capture failed: {e}");
-            // Keep buf for next attempt
-            *reuse_buf = Some(buf);
+            *reuse_frame = Some(frame);
             false
         }
     }

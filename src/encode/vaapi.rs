@@ -37,6 +37,16 @@ impl VaapiEncoder {
                 bail!("{msg}");
             }
         };
+        if probe.supports_vpp_nv12() && !probe.supports_h264() {
+            let msg = "VAAPI VPP RGB->NV12 probe succeeded, but this driver does not expose an H.264 encode entrypoint".to_string();
+            self.probe_error = Some(msg.clone());
+            bail!("{msg}");
+        }
+        if !probe.supports_vpp_nv12() {
+            let msg = "VAAPI imported the DMA-BUF source surface, but RGB->NV12 VPP is not available".to_string();
+            self.probe_error = Some(msg.clone());
+            bail!("{msg}");
+        }
         if !probe.supports_h264() {
             let msg = "VAAPI imported the DMA-BUF surface, but this driver does not expose an H.264 encode entrypoint".to_string();
             self.probe_error = Some(msg.clone());
@@ -130,6 +140,10 @@ impl VaapiProbe {
     fn supports_h264(&self) -> bool {
         unsafe { kmsvnc_vaapi_encoder_supports_h264(self.raw) != 0 }
     }
+
+    fn supports_vpp_nv12(&self) -> bool {
+        unsafe { kmsvnc_vaapi_encoder_supports_vpp_nv12(self.raw) != 0 }
+    }
 }
 
 impl Drop for VaapiProbe {
@@ -161,6 +175,7 @@ unsafe extern "C" {
         num_planes: u32,
     ) -> *mut VaapiEncoderProbeContext;
     fn kmsvnc_vaapi_encoder_supports_h264(ctx: *const VaapiEncoderProbeContext) -> i32;
+    fn kmsvnc_vaapi_encoder_supports_vpp_nv12(ctx: *const VaapiEncoderProbeContext) -> i32;
     fn kmsvnc_vaapi_encoder_close(ctx: *mut VaapiEncoderProbeContext);
     fn kmsvnc_vaapi_last_error() -> *const c_char;
 }

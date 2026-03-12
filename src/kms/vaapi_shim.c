@@ -373,7 +373,7 @@ struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
             offsets,
             pitches,
             num_planes,
-            VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER | VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ)) {
+            VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ)) {
         kmsvnc_vaapi_encoder_close(ctx);
         return NULL;
     }
@@ -395,6 +395,10 @@ struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
 
 int kmsvnc_vaapi_encoder_supports_h264(const struct kmsvnc_vaapi_encoder *ctx) {
     return ctx && ctx->supports_h264;
+}
+
+int kmsvnc_vaapi_encoder_supports_vpp_nv12(const struct kmsvnc_vaapi_encoder *ctx) {
+    return ctx && ctx->supports_vpp_nv12;
 }
 
 struct kmsvnc_vaapi *kmsvnc_vaapi_open(

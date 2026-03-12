@@ -292,6 +292,7 @@ fn setup_pipeline_frame_source(
     backend: &CaptureBackend,
 ) -> Result<Option<VideoFrameSourceFn>> {
     if matches!(config.video_encoder, VideoEncoderMode::Software)
+        && config.video_capture_scale
         && config.video_width.is_some()
         && config.video_height.is_some()
     {

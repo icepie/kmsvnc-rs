@@ -50,6 +50,7 @@ Then connect any VNC client to `localhost:5900`.
 --video-fps          Experimental video stream FPS limit
 --video-width        Experimental video stream output width
 --video-height       Experimental video stream output height
+--video-capture-scale Use experimental VAAPI-scaled capture for software video
 --port <port>        VNC listen port (default: 5900)
 --fps <fps>          Capture frame rate (default: 30)
 --listen <addr>      Listen address (default: 0.0.0.0)
@@ -80,6 +81,10 @@ sudo ./target/release/kmsvnc \
   --video-fps 10 \
   --video-stream-port 6000
 ```
+
+By default, software video encoding keeps using the existing stable capture path.
+Only add `--video-capture-scale` if you specifically want to test the experimental
+VAAPI-scaled capture source.
 
 Then connect with:
 

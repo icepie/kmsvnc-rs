@@ -82,4 +82,8 @@ pub struct Config {
     /// Experimental video stream output height. Defaults to capture height when omitted.
     #[arg(long)]
     pub video_height: Option<u32>,
+
+    /// Use experimental VAAPI-scaled capture for the software video stream.
+    #[arg(long, default_value_t = false)]
+    pub video_capture_scale: bool,
 }

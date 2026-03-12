@@ -24,7 +24,7 @@ use frame_diff::DirtyTiles;
 use kms::capture;
 use kms::dmabuf::DmabufCapturer;
 use kms::fbdev::FbdevCapture;
-use transport::{null::NullSink, PacketSink};
+use transport::{null::NullSink, tcp::TcpAnnexBSink, PacketSink};
 use video::VideoFrame;
 use vnc::server::{self, EncodingPreference, InputEvent};
 
@@ -247,9 +247,21 @@ fn setup_encoder(config: &Config) -> Option<EncoderBox> {
 
 fn setup_pipeline(config: &Config) -> Option<ExperimentalPipeline> {
     let encoder = setup_encoder(config)?;
+    let sink: PacketSinkBox = if config.video_stream_port != 0 {
+        let addr = format!("{}:{}", config.video_stream_listen, config.video_stream_port);
+        match TcpAnnexBSink::new(&addr) {
+            Ok(sink) => Box::new(sink),
+            Err(e) => {
+                tracing::warn!("Failed to create experimental Annex B sink: {e}");
+                Box::new(NullSink::new())
+            }
+        }
+    } else {
+        Box::new(NullSink::new())
+    };
     Some(ExperimentalPipeline {
         encoder,
-        sink: Box::new(NullSink::new()),
+        sink,
         pts: 0,
         frame_source: None,
     })

@@ -62,4 +62,12 @@ pub struct Config {
     /// Preferred codec for the experimental video pipeline.
     #[arg(long, value_enum, default_value = "h264")]
     pub video_codec: VideoCodecMode,
+
+    /// Experimental H.264 Annex B TCP output listen address.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub video_stream_listen: String,
+
+    /// Experimental H.264 Annex B TCP output port. Disabled when set to 0.
+    #[arg(long, default_value_t = 0)]
+    pub video_stream_port: u16,
 }

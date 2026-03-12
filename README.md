@@ -45,6 +45,8 @@ Then connect any VNC client to `localhost:5900`.
 --encoding <mode>    VNC encoding: raw, zlib, or auto (default: raw)
 --video-encoder <e>  Experimental video pipeline: none, software, vaapi
 --video-codec <c>    Experimental codec preference: h264, hevc, av1
+--video-stream-listen Experimental Annex B TCP listen address (default: 0.0.0.0)
+--video-stream-port  Experimental Annex B TCP port, 0 disables output
 --port <port>        VNC listen port (default: 5900)
 --fps <fps>          Capture frame rate (default: 30)
 --listen <addr>      Listen address (default: 0.0.0.0)
@@ -58,6 +60,25 @@ Control log verbosity with the `RUST_LOG` environment variable:
 ```bash
 RUST_LOG=info sudo $(which kmsvnc)    # default useful output
 RUST_LOG=debug sudo $(which kmsvnc)   # detailed diagnostics
+```
+
+### Experimental H.264 Stream
+
+When using software H.264 encoding, you can expose an Annex B stream over TCP:
+
+```bash
+sudo ./target/release/kmsvnc \
+  --device /dev/dri/card1 \
+  --output DP-1 \
+  --video-encoder software \
+  --video-codec h264 \
+  --video-stream-port 6000
+```
+
+Then connect with:
+
+```bash
+ffplay -fflags nobuffer -flags low_delay -f h264 tcp://127.0.0.1:6000?listen=0
 ```
 
 ## Limitations

@@ -53,10 +53,6 @@ struct ExperimentalPipeline {
     frame_source: Option<VideoFrameSourceFn>,
 }
 
-fn allow_capture_vaapi_readback(config: &Config) -> bool {
-    !matches!(config.video_encoder, VideoEncoderMode::Vaapi)
-}
-
 impl ExperimentalPipeline {
     fn process(&mut self, frame: &VideoFrame, force_keyframe: bool) -> Result<()> {
         let encode_frame = if let Some(source) = self.frame_source.as_mut() {
@@ -72,7 +68,7 @@ impl ExperimentalPipeline {
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(
-    config: &Config,
+    _config: &Config,
     path: &str,
     output_name: Option<&str>,
 ) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
@@ -85,7 +81,7 @@ fn try_drm_capture(
     let mut capturer = capture::Capturer::new_with_options(
         card,
         output,
-        allow_capture_vaapi_readback(config),
+        true,
     );
     let initial_data = capturer
         .capture(true)?
@@ -176,7 +172,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn, Ca
             let mut capturer = capture::Capturer::new_with_options(
                 card,
                 output,
-                allow_capture_vaapi_readback(config),
+                true,
             );
             let initial_data = capturer
                 .capture(true)?

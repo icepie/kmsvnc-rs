@@ -1,8 +1,9 @@
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 
 use anyhow::{bail, Context, Result};
 use drm::control::{crtc, framebuffer, Device as ControlDevice};
 use drm_fourcc::DrmModifier;
+use rustix::io::dup;
 
 use super::card::Card;
 use super::cpu_capture::ActiveOutput;
@@ -30,6 +31,7 @@ pub struct DmabufFrame {
     pub src_y: u32,
     pub fb_width: u32,
     pub fb_height: u32,
+    pub drm_device_fd: OwnedFd,
     pub objects: Vec<DmabufObject>,
     pub planes: Vec<DmabufPlane>,
 }
@@ -123,6 +125,7 @@ impl DmabufCapturer {
             src_y: self.src_y,
             fb_width: info.size().0,
             fb_height: info.size().1,
+            drm_device_fd: dup(self.card.as_fd()).context("dup DRM fd failed for DMA-BUF frame")?,
             objects,
             planes,
         })

@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <va/va.h>
+#include <va/va_enc_h264.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 
@@ -25,6 +26,17 @@ struct kmsvnc_vaapi {
     uint32_t height;
     uint32_t fb_width;
     uint32_t fb_height;
+};
+
+struct kmsvnc_vaapi_encoder {
+    VADisplay dpy;
+    VASurfaceID surface;
+    int display_fd;
+    int object_fds[4];
+    uint32_t width;
+    uint32_t height;
+    int supports_h264;
+    int supports_h264_low_power;
 };
 
 static char kmsvnc_vaapi_error[256];
@@ -85,6 +97,177 @@ void kmsvnc_vaapi_close(struct kmsvnc_vaapi *ctx) {
         close(ctx->prime_fd);
     }
     free(ctx);
+}
+
+void kmsvnc_vaapi_encoder_close(struct kmsvnc_vaapi_encoder *ctx) {
+    if (!ctx) {
+        return;
+    }
+    if (ctx->surface != VA_INVALID_ID) {
+        vaDestroySurfaces(ctx->dpy, &ctx->surface, 1);
+    }
+    if (ctx->dpy) {
+        vaTerminate(ctx->dpy);
+    }
+    if (ctx->display_fd >= 0) {
+        close(ctx->display_fd);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (ctx->object_fds[i] >= 0) {
+            close(ctx->object_fds[i]);
+        }
+    }
+    free(ctx);
+}
+
+static int kmsvnc_vaapi_open_display(int drm_fd, VADisplay *out_dpy, int *out_display_fd) {
+    char *render_node = drmGetRenderDeviceNameFromFd(drm_fd);
+    int display_fd = -1;
+    if (render_node) {
+        display_fd = open(render_node, O_RDWR);
+        free(render_node);
+    }
+    if (display_fd < 0) {
+        display_fd = dup(drm_fd);
+    }
+    if (display_fd < 0) {
+        set_errorf("failed to open DRM/render node for VAAPI", NULL);
+        return 0;
+    }
+
+    VADisplay dpy = vaGetDisplayDRM(display_fd);
+    if (!dpy) {
+        close(display_fd);
+        set_errorf("vaGetDisplayDRM failed", NULL);
+        return 0;
+    }
+
+    int major = 0;
+    int minor = 0;
+    if (!va_ok(vaInitialize(dpy, &major, &minor), "vaInitialize")) {
+        close(display_fd);
+        return 0;
+    }
+
+    *out_dpy = dpy;
+    *out_display_fd = display_fd;
+    return 1;
+}
+
+struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
+    int drm_fd,
+    uint32_t width,
+    uint32_t height,
+    uint32_t drm_format,
+    uint64_t modifier,
+    const int *object_fds,
+    const uint64_t *object_sizes,
+    uint32_t num_objects,
+    const uint32_t *object_indices,
+    const uint32_t *offsets,
+    const uint32_t *pitches,
+    uint32_t num_planes
+) {
+    struct kmsvnc_vaapi_encoder *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        set_errorf("out of memory", NULL);
+        return NULL;
+    }
+
+    ctx->surface = VA_INVALID_ID;
+    ctx->display_fd = -1;
+    for (int i = 0; i < 4; i++) {
+        ctx->object_fds[i] = -1;
+    }
+
+    if (!kmsvnc_vaapi_open_display(drm_fd, &ctx->dpy, &ctx->display_fd)) {
+        kmsvnc_vaapi_encoder_close(ctx);
+        return NULL;
+    }
+
+    VAEntrypoint entrypoints[16];
+    int num_entrypoints = 0;
+    if (va_ok(
+            vaQueryConfigEntrypoints(ctx->dpy, VAProfileH264Main, entrypoints, &num_entrypoints),
+            "vaQueryConfigEntrypoints")) {
+        for (int i = 0; i < num_entrypoints; i++) {
+            if (entrypoints[i] == VAEntrypointEncSlice) {
+                ctx->supports_h264 = 1;
+            } else if (entrypoints[i] == VAEntrypointEncSliceLP) {
+                ctx->supports_h264 = 1;
+                ctx->supports_h264_low_power = 1;
+            }
+        }
+    }
+
+    VADRMPRIMESurfaceDescriptor desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.width = width;
+    desc.height = height;
+    desc.fourcc = fourcc_code('B', 'G', 'R', 'X');
+    desc.num_objects = num_objects;
+    desc.num_layers = 1;
+    desc.layers[0].drm_format = drm_format;
+    desc.layers[0].num_planes = num_planes;
+
+    for (uint32_t i = 0; i < num_objects && i < 4; i++) {
+        ctx->object_fds[i] = dup(object_fds[i]);
+        if (ctx->object_fds[i] < 0) {
+            set_errorf("dup(object_fd) failed", NULL);
+            kmsvnc_vaapi_encoder_close(ctx);
+            return NULL;
+        }
+        desc.objects[i].fd = ctx->object_fds[i];
+        desc.objects[i].size = object_sizes[i];
+        desc.objects[i].drm_format_modifier = modifier;
+    }
+
+    for (uint32_t i = 0; i < num_planes && i < 4; i++) {
+        desc.layers[0].object_index[i] = object_indices[i];
+        desc.layers[0].offset[i] = offsets[i];
+        desc.layers[0].pitch[i] = pitches[i];
+    }
+
+    VASurfaceAttrib attrs[2];
+    memset(attrs, 0, sizeof(attrs));
+    attrs[0].type = VASurfaceAttribMemoryType;
+    attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[0].value.type = VAGenericValueTypeInteger;
+    attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    attrs[1].type = VASurfaceAttribExternalBufferDescriptor;
+    attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[1].value.type = VAGenericValueTypePointer;
+    attrs[1].value.value.p = &desc;
+
+    if (!va_ok(
+            vaCreateSurfaces(
+                ctx->dpy,
+                VA_RT_FORMAT_RGB32,
+                width,
+                height,
+                &ctx->surface,
+                1,
+                attrs,
+                2),
+            "vaCreateSurfaces")) {
+        kmsvnc_vaapi_encoder_close(ctx);
+        return NULL;
+    }
+
+    ctx->width = width;
+    ctx->height = height;
+    fprintf(stderr,
+        "kmsvnc vaapi encoder probe: import_ok=1 h264=%d low_power=%d size=%ux%u format=%u\n",
+        ctx->supports_h264,
+        ctx->supports_h264_low_power,
+        width,
+        height,
+        drm_format);
+    return ctx;
+}
+
+int kmsvnc_vaapi_encoder_supports_h264(const struct kmsvnc_vaapi_encoder *ctx) {
+    return ctx && ctx->supports_h264;
 }
 
 struct kmsvnc_vaapi *kmsvnc_vaapi_open(

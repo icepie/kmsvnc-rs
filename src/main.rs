@@ -22,6 +22,7 @@ use config::{Config, EncodingMode, VideoCodecMode, VideoEncoderMode};
 use encode::{software::SoftwareEncoder, vaapi::VaapiEncoder, VideoCodec, VideoEncoder};
 use frame_diff::DirtyTiles;
 use kms::capture;
+use kms::dmabuf::DmabufCapturer;
 use kms::fbdev::FbdevCapture;
 use transport::{null::NullSink, PacketSink};
 use video::VideoFrame;
@@ -32,31 +33,50 @@ use vnc::server::{self, EncodingPreference, InputEvent};
 /// `dirty_tiles` is provided for incremental tile-level capture.
 type CaptureFn =
     Box<dyn FnMut(bool, &mut VideoFrame, Option<&DirtyTiles>) -> Result<bool> + Send>;
+type VideoFrameSourceFn = Box<dyn FnMut() -> Result<VideoFrame> + Send>;
 
 type EncoderBox = Box<dyn VideoEncoder + Send>;
 type PacketSinkBox = Box<dyn PacketSink + Send>;
+
+enum CaptureBackend {
+    Drm {
+        device_path: String,
+        output_name: String,
+    },
+    Fbdev,
+}
 
 struct ExperimentalPipeline {
     encoder: EncoderBox,
     sink: PacketSinkBox,
     pts: u64,
+    frame_source: Option<VideoFrameSourceFn>,
 }
 
 impl ExperimentalPipeline {
     fn process(&mut self, frame: &VideoFrame, force_keyframe: bool) -> Result<()> {
-        let packet = self.encoder.encode(frame, force_keyframe, self.pts)?;
+        let encode_frame = if let Some(source) = self.frame_source.as_mut() {
+            source()?
+        } else {
+            clone_video_frame(frame)?
+        };
+        let packet = self.encoder.encode(&encode_frame, force_keyframe, self.pts)?;
         self.pts = self.pts.wrapping_add(1);
         self.sink.submit(packet)
     }
 }
 
 /// Try to set up DRM capture for a specific card path.
-fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
+fn try_drm_capture(
+    path: &str,
+    output_name: Option<&str>,
+) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
     let (card, outputs) = capture::open_card_path(path)?;
     let output = select_output(&outputs, output_name)?;
     let width = output.width;
     let height = output.height;
-    tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
+    let output_name = output.connector_name.clone();
+    tracing::info!("Output: {} ({}x{})", output_name, width, height);
     let mut capturer = capture::Capturer::new(card, output);
     let initial_data = capturer
         .capture(true)?
@@ -66,7 +86,16 @@ fn try_drm_capture(path: &str, output_name: Option<&str>) -> Result<(u32, u32, V
             let dst = frame.cpu_bgra_mut(width, height);
             capturer.capture_into(dst, force, dt)
         });
-    Ok((width, height, VideoFrame::new_cpu_bgra(width, height, initial_data), capture_fn))
+    Ok((
+        width,
+        height,
+        VideoFrame::new_cpu_bgra(width, height, initial_data),
+        capture_fn,
+        CaptureBackend::Drm {
+            device_path: path.to_string(),
+            output_name,
+        },
+    ))
 }
 
 fn select_output<'a>(
@@ -90,7 +119,7 @@ fn select_output<'a>(
 }
 
 /// Try to set up fbdev capture for a specific device path.
-fn try_fbdev_capture(path: &str) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
+fn try_fbdev_capture(path: &str) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
     let fbdev = FbdevCapture::open(path)?;
     let width = fbdev.width();
     let height = fbdev.height();
@@ -100,11 +129,17 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
         fbdev.capture_frame_into(dst)?;
         Ok(true)
     });
-    Ok((width, height, VideoFrame::new_cpu_bgra(width, height, initial_data), capture_fn))
+    Ok((
+        width,
+        height,
+        VideoFrame::new_cpu_bgra(width, height, initial_data),
+        capture_fn,
+        CaptureBackend::Fbdev,
+    ))
 }
 
 /// Set up capture with fallback chain: DRM (PRIME/dumb) -> fbdev.
-fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
+fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
     if let Some(ref path) = config.device {
         // User specified a device — try as DRM first, then as fbdev
         match try_drm_capture(path, config.output.as_deref()) {
@@ -122,12 +157,13 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
     }
 
     // Auto-detect: try all DRM cards first
-    match capture::open_card() {
-        Ok((card, outputs)) => {
+    match capture::open_card_with_path() {
+        Ok((device_path, card, outputs)) => {
             let output = select_output(&outputs, config.output.as_deref())?;
             let width = output.width;
             let height = output.height;
-            tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
+            let output_name = output.connector_name.clone();
+            tracing::info!("Output: {} ({}x{})", output_name, width, height);
             let mut capturer = capture::Capturer::new(card, output);
             let initial_data = capturer
                 .capture(true)?
@@ -141,6 +177,10 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn)> {
                 height,
                 VideoFrame::new_cpu_bgra(width, height, initial_data),
                 capture_fn,
+                CaptureBackend::Drm {
+                    device_path,
+                    output_name,
+                },
             ));
         }
         Err(drm_err) => {
@@ -202,7 +242,50 @@ fn setup_pipeline(config: &Config) -> Option<ExperimentalPipeline> {
         encoder,
         sink: Box::new(NullSink::new()),
         pts: 0,
+        frame_source: None,
     })
+}
+
+fn setup_pipeline_frame_source(
+    config: &Config,
+    backend: &CaptureBackend,
+) -> Result<Option<VideoFrameSourceFn>> {
+    if !matches!(config.video_encoder, VideoEncoderMode::Vaapi) {
+        return Ok(None);
+    }
+    let CaptureBackend::Drm {
+        device_path,
+        output_name,
+    } = backend
+    else {
+        tracing::warn!("VAAPI video pipeline requires a DRM capture backend");
+        return Ok(None);
+    };
+
+    let (card, outputs) = capture::open_card_path(device_path)?;
+    let output = outputs
+        .iter()
+        .find(|o| o.connector_name == *output_name)
+        .with_context(|| format!("Output {output_name} disappeared before pipeline setup"))?;
+    let mut capturer = DmabufCapturer::new(card, output);
+    Ok(Some(Box::new(move || Ok(VideoFrame::Dmabuf(capturer.capture()?)))))
+}
+
+fn clone_video_frame(frame: &VideoFrame) -> Result<VideoFrame> {
+    match frame {
+        VideoFrame::CpuBgra {
+            width,
+            height,
+            stride,
+            data,
+        } => Ok(VideoFrame::CpuBgra {
+            width: *width,
+            height: *height,
+            stride: *stride,
+            data: data.clone(),
+        }),
+        VideoFrame::Dmabuf(_) => bail!("DMA-BUF frame cloning is not supported"),
+    }
 }
 
 #[tokio::main]
@@ -218,8 +301,11 @@ async fn main() -> Result<()> {
 
     check_permissions();
 
-    let (width, height, initial_data, capture_fn) = setup_capture(&config)?;
-    let pipeline = setup_pipeline(&config);
+    let (width, height, initial_data, capture_fn, backend) = setup_capture(&config)?;
+    let mut pipeline = setup_pipeline(&config);
+    if let Some(ref mut pipeline) = pipeline {
+        pipeline.frame_source = setup_pipeline_frame_source(&config, &backend)?;
+    }
 
     // Shared dirty tile accumulator between capture thread and VNC server
     let dirty_tiles = Arc::new(DirtyTiles::new(width, height));

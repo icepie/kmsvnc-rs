@@ -37,6 +37,12 @@ pub struct ActiveOutput {
 
 /// Open the first DRI card that has connected outputs.
 pub fn open_card() -> Result<(Card, Vec<ActiveOutput>)> {
+    let (_path, card, outputs) = open_card_with_path()?;
+    Ok((card, outputs))
+}
+
+/// Open the first DRI card that has connected outputs and return its path.
+pub fn open_card_with_path() -> Result<(String, Card, Vec<ActiveOutput>)> {
     let mut entries: Vec<_> = fs::read_dir("/dev/dri")?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -64,7 +70,7 @@ pub fn open_card() -> Result<(Card, Vec<ActiveOutput>)> {
                     "KMS: using {path_str} with {} active output(s)",
                     outputs.len()
                 );
-                return Ok((card, outputs));
+                return Ok((path_str.into_owned(), card, outputs));
             }
             Ok(_) => {
                 tracing::debug!("{path_str}: no active outputs");

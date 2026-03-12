@@ -53,6 +53,10 @@ struct ExperimentalPipeline {
     frame_source: Option<VideoFrameSourceFn>,
 }
 
+fn allow_capture_vaapi_readback(config: &Config) -> bool {
+    !matches!(config.video_encoder, VideoEncoderMode::Vaapi)
+}
+
 impl ExperimentalPipeline {
     fn process(&mut self, frame: &VideoFrame, force_keyframe: bool) -> Result<()> {
         let encode_frame = if let Some(source) = self.frame_source.as_mut() {
@@ -68,6 +72,7 @@ impl ExperimentalPipeline {
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(
+    config: &Config,
     path: &str,
     output_name: Option<&str>,
 ) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
@@ -77,7 +82,11 @@ fn try_drm_capture(
     let height = output.height;
     let output_name = output.connector_name.clone();
     tracing::info!("Output: {} ({}x{})", output_name, width, height);
-    let mut capturer = capture::Capturer::new(card, output);
+    let mut capturer = capture::Capturer::new_with_options(
+        card,
+        output,
+        allow_capture_vaapi_readback(config),
+    );
     let initial_data = capturer
         .capture(true)?
         .expect("first capture must produce a frame");
@@ -142,7 +151,7 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, VideoFrame, CaptureFn, Cap
 fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn, CaptureBackend)> {
     if let Some(ref path) = config.device {
         // User specified a device — try as DRM first, then as fbdev
-        match try_drm_capture(path, config.output.as_deref()) {
+        match try_drm_capture(config, path, config.output.as_deref()) {
             Ok(result) => return Ok(result),
             Err(drm_err) => {
                 tracing::debug!("DRM capture failed for {path}: {drm_err}");
@@ -164,7 +173,11 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, VideoFrame, CaptureFn, Ca
             let height = output.height;
             let output_name = output.connector_name.clone();
             tracing::info!("Output: {} ({}x{})", output_name, width, height);
-            let mut capturer = capture::Capturer::new(card, output);
+            let mut capturer = capture::Capturer::new_with_options(
+                card,
+                output,
+                allow_capture_vaapi_readback(config),
+            );
             let initial_data = capturer
                 .capture(true)?
                 .expect("first capture must produce a frame");

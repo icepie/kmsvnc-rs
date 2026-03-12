@@ -180,6 +180,7 @@ pub struct Capturer {
     cache: Vec<CachedBuffer>,
     last_fb_key: Option<u32>,
     vaapi_cache: Vec<VaapiCapture>,
+    allow_vaapi_readback: bool,
 }
 
 // SAFETY: The mmap pointers in CachedBuffer are read-only and their backing
@@ -189,6 +190,10 @@ unsafe impl Send for VaapiCapture {}
 
 impl Capturer {
     pub fn new(card: Card, output: &ActiveOutput) -> Self {
+        Self::new_with_options(card, output, true)
+    }
+
+    pub fn new_with_options(card: Card, output: &ActiveOutput, allow_vaapi_readback: bool) -> Self {
         Self {
             crtc_handle: output.crtc_handle,
             default_fb: output.fb_handle,
@@ -201,6 +206,7 @@ impl Capturer {
             cache: Vec::new(),
             last_fb_key: None,
             vaapi_cache: Vec::new(),
+            allow_vaapi_readback,
             card,
         }
     }
@@ -445,6 +451,9 @@ impl Capturer {
         match self.map_gem_cached(fb_handle, gem_handle, pitch, format) {
             Ok(entry) => Ok(Some(entry)),
             Err(cpu_err) => {
+                if !self.allow_vaapi_readback {
+                    return Err(cpu_err);
+                }
                 tracing::debug!("CPU mapping failed for FB2 ({cpu_err}), trying VAAPI");
                 tracing::debug!(
                     "Creating VAAPI capture for fb={} gem={}",

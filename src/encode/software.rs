@@ -1,4 +1,5 @@
 use std::ffi::c_char;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -8,11 +9,18 @@ use crate::video::VideoFrame;
 pub struct SoftwareEncoder {
     codec: VideoCodec,
     inner: Option<X264Encoder>,
+    frames_encoded: u64,
+    started_at: Instant,
 }
 
 impl SoftwareEncoder {
     pub fn new(codec: VideoCodec) -> Self {
-        Self { codec, inner: None }
+        Self {
+            codec,
+            inner: None,
+            frames_encoded: 0,
+            started_at: Instant::now(),
+        }
     }
 
     fn ensure_encoder(&mut self, width: u32, height: u32) -> Result<&mut X264Encoder> {
@@ -40,6 +48,25 @@ impl VideoEncoder for SoftwareEncoder {
         let (width, height, stride, data) = frame.as_bgra()?;
         let enc = self.ensure_encoder(width, height)?;
         let packet = enc.encode(data, stride, pts, force_keyframe)?;
+        self.frames_encoded += 1;
+        if self.frames_encoded == 1 {
+            tracing::info!(
+                "Software H.264 encoder active: {}x{} stride={} codec={:?}",
+                width,
+                height,
+                stride,
+                self.codec
+            );
+        } else if self.frames_encoded % 120 == 0 {
+            let secs = self.started_at.elapsed().as_secs_f32().max(0.001);
+            tracing::info!(
+                "Software H.264 encoder progress: frames={} avg_fps={:.1} last_packet_bytes={} keyframe={}",
+                self.frames_encoded,
+                self.frames_encoded as f32 / secs,
+                packet.data.len(),
+                packet.keyframe,
+            );
+        }
         Ok(EncodedPacket {
             codec: VideoCodec::H264,
             data: packet.data,

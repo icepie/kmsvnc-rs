@@ -70,4 +70,16 @@ pub struct Config {
     /// Experimental H.264 Annex B TCP output port. Disabled when set to 0.
     #[arg(long, default_value_t = 0)]
     pub video_stream_port: u16,
+
+    /// Experimental video stream FPS limit. Defaults to capture FPS when omitted.
+    #[arg(long)]
+    pub video_fps: Option<u32>,
+
+    /// Experimental video stream output width. Defaults to capture width when omitted.
+    #[arg(long)]
+    pub video_width: Option<u32>,
+
+    /// Experimental video stream output height. Defaults to capture height when omitted.
+    #[arg(long)]
+    pub video_height: Option<u32>,
 }

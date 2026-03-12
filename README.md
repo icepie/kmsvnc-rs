@@ -47,6 +47,9 @@ Then connect any VNC client to `localhost:5900`.
 --video-codec <c>    Experimental codec preference: h264, hevc, av1
 --video-stream-listen Experimental Annex B TCP listen address (default: 0.0.0.0)
 --video-stream-port  Experimental Annex B TCP port, 0 disables output
+--video-fps          Experimental video stream FPS limit
+--video-width        Experimental video stream output width
+--video-height       Experimental video stream output height
 --port <port>        VNC listen port (default: 5900)
 --fps <fps>          Capture frame rate (default: 30)
 --listen <addr>      Listen address (default: 0.0.0.0)
@@ -72,6 +75,9 @@ sudo ./target/release/kmsvnc \
   --output DP-1 \
   --video-encoder software \
   --video-codec h264 \
+  --video-width 1280 \
+  --video-height 720 \
+  --video-fps 10 \
   --video-stream-port 6000
 ```
 

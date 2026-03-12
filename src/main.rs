@@ -51,10 +51,19 @@ struct ExperimentalPipeline {
     sink: PacketSinkBox,
     pts: u64,
     frame_source: Option<VideoFrameSourceFn>,
+    min_frame_interval: Option<Duration>,
+    last_frame_at: Option<Instant>,
 }
 
 impl ExperimentalPipeline {
     fn process(&mut self, frame: &VideoFrame, force_keyframe: bool) -> Result<()> {
+        if let Some(min_interval) = self.min_frame_interval {
+            if let Some(last) = self.last_frame_at {
+                if !force_keyframe && last.elapsed() < min_interval {
+                    return Ok(());
+                }
+            }
+        }
         let encode_frame = if let Some(source) = self.frame_source.as_mut() {
             source()?
         } else {
@@ -62,6 +71,7 @@ impl ExperimentalPipeline {
         };
         let packet = self.encoder.encode(&encode_frame, force_keyframe, self.pts)?;
         self.pts = self.pts.wrapping_add(1);
+        self.last_frame_at = Some(Instant::now());
         self.sink.submit(packet)
     }
 }
@@ -240,7 +250,11 @@ fn setup_encoder(config: &Config) -> Option<EncoderBox> {
     let codec = select_video_codec(&config.video_codec);
     match config.video_encoder {
         VideoEncoderMode::None => None,
-        VideoEncoderMode::Software => Some(Box::new(SoftwareEncoder::new(codec))),
+        VideoEncoderMode::Software => Some(Box::new(SoftwareEncoder::new(
+            codec,
+            config.video_width,
+            config.video_height,
+        ))),
         VideoEncoderMode::Vaapi => Some(Box::new(VaapiEncoder::new(codec))),
     }
 }
@@ -264,6 +278,11 @@ fn setup_pipeline(config: &Config) -> Option<ExperimentalPipeline> {
         sink,
         pts: 0,
         frame_source: None,
+        min_frame_interval: config
+            .video_fps
+            .filter(|fps| *fps > 0)
+            .map(|fps| Duration::from_millis(1000 / fps as u64)),
+        last_frame_at: None,
     })
 }
 

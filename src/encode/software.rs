@@ -1,7 +1,7 @@
 use std::ffi::c_char;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::encode::{EncodedPacket, VideoCodec, VideoEncoder};
 use crate::video::VideoFrame;
@@ -11,23 +11,30 @@ pub struct SoftwareEncoder {
     inner: Option<X264Encoder>,
     frames_encoded: u64,
     started_at: Instant,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    scaled_bgra: Vec<u8>,
 }
 
 impl SoftwareEncoder {
-    pub fn new(codec: VideoCodec) -> Self {
+    pub fn new(codec: VideoCodec, target_width: Option<u32>, target_height: Option<u32>) -> Self {
         Self {
             codec,
             inner: None,
             frames_encoded: 0,
             started_at: Instant::now(),
+            target_width,
+            target_height,
+            scaled_bgra: Vec::new(),
         }
     }
 
-    fn ensure_encoder(&mut self, width: u32, height: u32) -> Result<&mut X264Encoder> {
-        if self.inner.is_none() {
-            self.inner = Some(X264Encoder::new(width, height)?);
+    fn take_or_create_encoder(&mut self, width: u32, height: u32) -> Result<X264Encoder> {
+        match self.inner.take() {
+            Some(enc) if enc.width == width && enc.height == height => Ok(enc),
+            Some(_enc) => X264Encoder::new(width, height),
+            None => X264Encoder::new(width, height),
         }
-        self.inner.as_mut().context("x264 encoder missing after init")
     }
 }
 
@@ -45,13 +52,25 @@ impl VideoEncoder for SoftwareEncoder {
         if self.codec != VideoCodec::H264 {
             bail!("Software encoder currently only supports H.264");
         }
-        let (width, height, stride, data) = frame.as_bgra()?;
-        let enc = self.ensure_encoder(width, height)?;
-        let packet = enc.encode(data, stride, pts, force_keyframe)?;
+        let (src_width, src_height, src_stride, data) = frame.as_bgra()?;
+        let dst_width = self.target_width.unwrap_or(src_width);
+        let dst_height = self.target_height.unwrap_or(src_height);
+        let (width, height, stride) =
+            self.prepare_bgra(data, src_width, src_height, src_stride, dst_width, dst_height);
+        let mut enc = self.take_or_create_encoder(width, height)?;
+        let bgra = if src_width == dst_width && src_height == dst_height {
+            data
+        } else {
+            &self.scaled_bgra
+        };
+        let packet = enc.encode(bgra, stride, pts, force_keyframe)?;
+        self.inner = Some(enc);
         self.frames_encoded += 1;
         if self.frames_encoded == 1 {
             tracing::info!(
-                "Software H.264 encoder active: {}x{} stride={} codec={:?}",
+                "Software H.264 encoder active: input={}x{} output={}x{} stride={} codec={:?}",
+                src_width,
+                src_height,
                 width,
                 height,
                 stride,
@@ -76,8 +95,46 @@ impl VideoEncoder for SoftwareEncoder {
     }
 }
 
+impl SoftwareEncoder {
+    fn prepare_bgra(
+        &mut self,
+        src: &[u8],
+        src_width: u32,
+        src_height: u32,
+        src_stride: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> (u32, u32, u32) {
+        if src_width == dst_width && src_height == dst_height {
+            return (src_width, src_height, src_stride);
+        }
+
+        let dst_stride = dst_width * 4;
+        let needed = (dst_stride * dst_height) as usize;
+        if self.scaled_bgra.len() != needed {
+            self.scaled_bgra.resize(needed, 0);
+        }
+
+        for y in 0..dst_height {
+            let src_y = (y as u64 * src_height as u64 / dst_height as u64) as u32;
+            let src_row = &src[(src_y * src_stride) as usize..];
+            let dst_row = &mut self.scaled_bgra[(y * dst_stride) as usize..][..dst_stride as usize];
+            for x in 0..dst_width {
+                let src_x = (x as u64 * src_width as u64 / dst_width as u64) as u32;
+                let src_off = (src_x * 4) as usize;
+                let dst_off = (x * 4) as usize;
+                dst_row[dst_off..dst_off + 4].copy_from_slice(&src_row[src_off..src_off + 4]);
+            }
+        }
+
+        (dst_width, dst_height, dst_stride)
+    }
+}
+
 struct X264Encoder {
     raw: *mut X264EncoderContext,
+    width: u32,
+    height: u32,
 }
 
 // SAFETY: encoder context is owned and used by the single pipeline thread.
@@ -89,7 +146,7 @@ impl X264Encoder {
         if raw.is_null() {
             bail!("x264 init failed: {}", x264_last_error());
         }
-        Ok(Self { raw })
+        Ok(Self { raw, width, height })
     }
 
     fn encode(&mut self, bgra: &[u8], stride: u32, pts: u64, force_keyframe: bool) -> Result<X264Packet> {

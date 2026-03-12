@@ -11,6 +11,7 @@
 #include <va/va_enc_h264.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
+#include <va/va_vpp.h>
 
 struct kmsvnc_vaapi {
     VADisplay dpy;
@@ -31,12 +32,17 @@ struct kmsvnc_vaapi {
 struct kmsvnc_vaapi_encoder {
     VADisplay dpy;
     VASurfaceID surface;
+    VASurfaceID vpp_output_surface;
+    VAConfigID vpp_config;
+    VAContextID vpp_context;
     int display_fd;
     int object_fds[4];
     uint32_t width;
     uint32_t height;
     int supports_h264;
     int supports_h264_low_power;
+    int supports_vpp;
+    int supports_vpp_nv12;
 };
 
 static char kmsvnc_vaapi_error[256];
@@ -103,6 +109,15 @@ void kmsvnc_vaapi_encoder_close(struct kmsvnc_vaapi_encoder *ctx) {
     if (!ctx) {
         return;
     }
+    if (ctx->vpp_context != VA_INVALID_ID) {
+        vaDestroyContext(ctx->dpy, ctx->vpp_context);
+    }
+    if (ctx->vpp_config != VA_INVALID_ID) {
+        vaDestroyConfig(ctx->dpy, ctx->vpp_config);
+    }
+    if (ctx->vpp_output_surface != VA_INVALID_ID) {
+        vaDestroySurfaces(ctx->dpy, &ctx->vpp_output_surface, 1);
+    }
     if (ctx->surface != VA_INVALID_ID) {
         vaDestroySurfaces(ctx->dpy, &ctx->surface, 1);
     }
@@ -154,6 +169,148 @@ static int kmsvnc_vaapi_open_display(int drm_fd, VADisplay *out_dpy, int *out_di
     return 1;
 }
 
+static int kmsvnc_vaapi_import_prime_surface(
+    struct kmsvnc_vaapi_encoder *ctx,
+    uint32_t width,
+    uint32_t height,
+    uint32_t drm_format,
+    uint64_t modifier,
+    const int *object_fds,
+    const uint64_t *object_sizes,
+    uint32_t num_objects,
+    const uint32_t *object_indices,
+    const uint32_t *offsets,
+    const uint32_t *pitches,
+    uint32_t num_planes,
+    uint32_t usage_hint
+) {
+    VADRMPRIMESurfaceDescriptor desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.width = width;
+    desc.height = height;
+    desc.fourcc = fourcc_code('B', 'G', 'R', 'X');
+    desc.num_objects = num_objects;
+    desc.num_layers = 1;
+    desc.layers[0].drm_format = drm_format;
+    desc.layers[0].num_planes = num_planes;
+
+    for (uint32_t i = 0; i < num_objects && i < 4; i++) {
+        ctx->object_fds[i] = dup(object_fds[i]);
+        if (ctx->object_fds[i] < 0) {
+            set_errorf("dup(object_fd) failed", NULL);
+            return 0;
+        }
+        desc.objects[i].fd = ctx->object_fds[i];
+        desc.objects[i].size = object_sizes[i];
+        desc.objects[i].drm_format_modifier = modifier;
+    }
+
+    for (uint32_t i = 0; i < num_planes && i < 4; i++) {
+        desc.layers[0].object_index[i] = object_indices[i];
+        desc.layers[0].offset[i] = offsets[i];
+        desc.layers[0].pitch[i] = pitches[i];
+    }
+
+    VASurfaceAttrib attrs[3];
+    memset(attrs, 0, sizeof(attrs));
+    attrs[0].type = VASurfaceAttribMemoryType;
+    attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[0].value.type = VAGenericValueTypeInteger;
+    attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    attrs[1].type = VASurfaceAttribExternalBufferDescriptor;
+    attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[1].value.type = VAGenericValueTypePointer;
+    attrs[1].value.value.p = &desc;
+    attrs[2].type = VASurfaceAttribUsageHint;
+    attrs[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    attrs[2].value.type = VAGenericValueTypeInteger;
+    attrs[2].value.value.i = usage_hint;
+
+    if (!va_ok(
+            vaCreateSurfaces(
+                ctx->dpy,
+                VA_RT_FORMAT_RGB32,
+                width,
+                height,
+                &ctx->surface,
+                1,
+                attrs,
+                3),
+            "vaCreateSurfaces")) {
+        return 0;
+    }
+    return 1;
+}
+
+static void kmsvnc_vaapi_probe_vpp_nv12(struct kmsvnc_vaapi_encoder *ctx) {
+    VAEntrypoint entrypoints[16];
+    int num_entrypoints = 0;
+    if (!va_ok(
+            vaQueryConfigEntrypoints(ctx->dpy, VAProfileNone, entrypoints, &num_entrypoints),
+            "vaQueryConfigEntrypoints")) {
+        return;
+    }
+
+    int has_vpp = 0;
+    for (int i = 0; i < num_entrypoints; i++) {
+        if (entrypoints[i] == VAEntrypointVideoProc) {
+            has_vpp = 1;
+            break;
+        }
+    }
+    if (!has_vpp) {
+        return;
+    }
+    ctx->supports_vpp = 1;
+
+    if (!va_ok(
+            vaCreateConfig(ctx->dpy, VAProfileNone, VAEntrypointVideoProc, NULL, 0, &ctx->vpp_config),
+            "vaCreateConfig(VideoProc)")) {
+        return;
+    }
+
+    VASurfaceAttrib out_attrs[2];
+    memset(out_attrs, 0, sizeof(out_attrs));
+    out_attrs[0].type = VASurfaceAttribPixelFormat;
+    out_attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    out_attrs[0].value.type = VAGenericValueTypeInteger;
+    out_attrs[0].value.value.i = VA_FOURCC_NV12;
+    out_attrs[1].type = VASurfaceAttribUsageHint;
+    out_attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    out_attrs[1].value.type = VAGenericValueTypeInteger;
+    out_attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_VPP_WRITE | VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER;
+
+    if (!va_ok(
+            vaCreateSurfaces(
+                ctx->dpy,
+                VA_RT_FORMAT_YUV420,
+                ctx->width,
+                ctx->height,
+                &ctx->vpp_output_surface,
+                1,
+                out_attrs,
+                2),
+            "vaCreateSurfaces(NV12 VPP output)")) {
+        return;
+    }
+
+    if (!va_ok(
+            vaCreateContext(
+                ctx->dpy,
+                ctx->vpp_config,
+                ctx->width,
+                ctx->height,
+                VA_PROGRESSIVE,
+                &ctx->vpp_output_surface,
+                1,
+                &ctx->vpp_context),
+            "vaCreateContext(VideoProc)")) {
+        return;
+    }
+
+    ctx->supports_vpp_nv12 = 1;
+}
+
 struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
     int drm_fd,
     uint32_t width,
@@ -175,6 +332,9 @@ struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
     }
 
     ctx->surface = VA_INVALID_ID;
+    ctx->vpp_output_surface = VA_INVALID_ID;
+    ctx->vpp_config = VA_INVALID_ID;
+    ctx->vpp_context = VA_INVALID_ID;
     ctx->display_fd = -1;
     for (int i = 0; i < 4; i++) {
         ctx->object_fds[i] = -1;
@@ -200,66 +360,33 @@ struct kmsvnc_vaapi_encoder *kmsvnc_vaapi_encoder_open(
         }
     }
 
-    VADRMPRIMESurfaceDescriptor desc;
-    memset(&desc, 0, sizeof(desc));
-    desc.width = width;
-    desc.height = height;
-    desc.fourcc = fourcc_code('B', 'G', 'R', 'X');
-    desc.num_objects = num_objects;
-    desc.num_layers = 1;
-    desc.layers[0].drm_format = drm_format;
-    desc.layers[0].num_planes = num_planes;
-
-    for (uint32_t i = 0; i < num_objects && i < 4; i++) {
-        ctx->object_fds[i] = dup(object_fds[i]);
-        if (ctx->object_fds[i] < 0) {
-            set_errorf("dup(object_fd) failed", NULL);
-            kmsvnc_vaapi_encoder_close(ctx);
-            return NULL;
-        }
-        desc.objects[i].fd = ctx->object_fds[i];
-        desc.objects[i].size = object_sizes[i];
-        desc.objects[i].drm_format_modifier = modifier;
-    }
-
-    for (uint32_t i = 0; i < num_planes && i < 4; i++) {
-        desc.layers[0].object_index[i] = object_indices[i];
-        desc.layers[0].offset[i] = offsets[i];
-        desc.layers[0].pitch[i] = pitches[i];
-    }
-
-    VASurfaceAttrib attrs[2];
-    memset(attrs, 0, sizeof(attrs));
-    attrs[0].type = VASurfaceAttribMemoryType;
-    attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    attrs[0].value.type = VAGenericValueTypeInteger;
-    attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
-    attrs[1].type = VASurfaceAttribExternalBufferDescriptor;
-    attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    attrs[1].value.type = VAGenericValueTypePointer;
-    attrs[1].value.value.p = &desc;
-
-    if (!va_ok(
-            vaCreateSurfaces(
-                ctx->dpy,
-                VA_RT_FORMAT_RGB32,
-                width,
-                height,
-                &ctx->surface,
-                1,
-                attrs,
-                2),
-            "vaCreateSurfaces")) {
+    if (!kmsvnc_vaapi_import_prime_surface(
+            ctx,
+            width,
+            height,
+            drm_format,
+            modifier,
+            object_fds,
+            object_sizes,
+            num_objects,
+            object_indices,
+            offsets,
+            pitches,
+            num_planes,
+            VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER | VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ)) {
         kmsvnc_vaapi_encoder_close(ctx);
         return NULL;
     }
 
     ctx->width = width;
     ctx->height = height;
+    kmsvnc_vaapi_probe_vpp_nv12(ctx);
     fprintf(stderr,
-        "kmsvnc vaapi encoder probe: import_ok=1 h264=%d low_power=%d size=%ux%u format=%u\n",
+        "kmsvnc vaapi encoder probe: import_ok=1 h264=%d low_power=%d vpp=%d vpp_nv12=%d size=%ux%u format=%u\n",
         ctx->supports_h264,
         ctx->supports_h264_low_power,
+        ctx->supports_vpp,
+        ctx->supports_vpp_nv12,
         width,
         height,
         drm_format);
